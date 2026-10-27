@@ -1,108 +1,175 @@
-from pathlib import Path
-import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+import numpy as np
 
-sns.set_theme(style="whitegrid")
-DATA_DIR = Path(".")  # Place the supplied CSVs beside this notebook, or change this directory.
-OUTPUT = Path("Quarterly_Quadrant_Results.xlsx")
-SECTORS = ["XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU", "XLV", "XLY"]
-REGIMES = ["Reflation", "Goldilocks", "Stagflation", "Disinflation / Slowdown"]
-COLORS = {"Reflation": "#2e9c64", "Goldilocks": "#377ed0", "Stagflation": "#d95757", "Disinflation / Slowdown": "#d4a536"}
+# Define our structural assets
+sectors = ["XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU", "XLV", "XLY"]
 
-def locate(name):
-    candidates = [DATA_DIR / f"{name}.csv"] + sorted(DATA_DIR.glob(f"{name}(*)*.csv"))
-    for path in candidates:
-        if path.is_file():
-            return path
-    raise FileNotFoundError(f"Missing {name}.csv in {DATA_DIR.resolve()}")
+print("⏳ Stage 1: Initiating Data Ingestion...")
 
-def read_series(name):
-    df = pd.read_csv(locate(name))
-    date_col = "observation_date" if "observation_date" in df.columns else "Date"
-    df["Date"] = pd.to_datetime(df[date_col])
-    df[name] = pd.to_numeric(df[name], errors="coerce")
-    df = df.dropna(subset=["Date"]).sort_values("Date").drop_duplicates("Date", keep="last")
-    return df.set_index("Date")[[name]]
+# 1. Load raw macro data from your folder
+df_growth = pd.read_csv("INDPRO.csv")
+df_infl = pd.read_csv("CPILFESL.csv")
 
+# 2. Standardize dates and sort oldest-to-newest
+df_growth['Date'] = pd.to_datetime(df_growth['observation_date'])
+df_growth = df_growth.sort_values('Date').reset_index(drop=True)
 
-monthly = read_series("INDPRO").join(read_series("CPILFESL"), how="inner").sort_index()
-monthly = monthly.asfreq("MS")  # Missing months remain missing; never silently interpolate.
-monthly["Growth_3M_MA"] = monthly["INDPRO"].rolling(3, min_periods=3).mean()
-monthly["Core_CPI_MoM_Pct"] = monthly["CPILFESL"].pct_change(fill_method=None) * 100
-monthly["Inflation_3M_MA"] = monthly["Core_CPI_MoM_Pct"].rolling(3, min_periods=3).mean()
+df_infl['Date'] = pd.to_datetime(df_infl['observation_date'])
+df_infl = df_infl.sort_values('Date').reset_index(drop=True)
 
-# Require the actual last calendar month of the quarter, not the latest available earlier month.
-q_months = monthly.loc[monthly.index.month.isin([3, 6, 9, 12])].copy()
-q_months.index = q_months.index.to_period("Q")
-quarterly = q_months[["INDPRO", "CPILFESL", "Growth_3M_MA", "Inflation_3M_MA"]].copy()
-quarterly.index.name = "Quarter"
-quarterly["Growth_Score"] = quarterly["Growth_3M_MA"].diff()
-quarterly["Inflation_Score"] = quarterly["Inflation_3M_MA"].diff()
+# 3. Merge them into a single core macro data frame
+macro_df = pd.merge(df_growth[['Date', 'INDPRO']], df_infl[['Date', 'CPILFESL']], on='Date', how='outer')
+macro_df = macro_df.sort_values('Date').reset_index(drop=True)
 
-def regime(row):
-    if pd.isna(row["Growth_Score"]) or pd.isna(row["Inflation_Score"]):
+print("✅ Macro files aligned successfully.")
+print(macro_df.head(3))
+
+print("\n⏳ Stage 2: Processing Sector ETF Data & Monthly Returns...")
+
+sector_dfs = []
+
+for ticker in sectors:
+    # Load the specific sector file
+    df_sector = pd.read_csv(f"{ticker}.csv")
+
+    # Standardize dates and sort chronologically
+    df_sector['Date'] = pd.to_datetime(df_sector['Date'])
+    df_sector = df_sector.sort_values('Date').reset_index(drop=True)
+
+    # Calculate Monthly Return: (Current Adj Close / Previous Adj Close) - 1
+    df_sector[f'{ticker}_Return'] = df_sector['Adj Close'].pct_change()
+
+    # Keep only the columns we need to prevent clutter
+    sector_dfs.append(df_sector[['Date', f'{ticker}_Return']])
+
+# Merge all 11 sector return columns into a unified data frame
+merged_sectors = sector_dfs[0]
+for next_df in sector_dfs[1:]:
+    merged_sectors = pd.merge(merged_sectors, next_df, on='Date', how='outer')
+
+print("✅ All 11 sector ETF monthly returns calculated and unified.")
+
+print("\n🔍 --- STAGE 1 VERIFICATION REPORT ---")
+print(f"Macro Data Shape (Rows, Columns): {macro_df.shape}")
+print(f"Macro Columns: {macro_df.columns.tolist()}")
+print("----------------------------------------")
+print(f"Sector Returns Shape (Rows, Columns): {merged_sectors.shape}")
+print(f"Sector Columns: {merged_sectors.columns.tolist()}")
+print("=======================================")
+
+print("\n⏳ Stage 2: Engineering Macro Momentum Scores")
+
+# 1. GROWTH MOMENTUM VECTOR (INDPRO)
+macro_df['Growth_3M_MA'] = macro_df['INDPRO'].rolling(window=3).mean()
+macro_df['Growth_12M_MA'] = macro_df['INDPRO'].rolling(window=12).mean()
+# Score > 0 means growth is accelerating; Score <= 0 means decelerating
+macro_df['Growth_Score'] = macro_df['Growth_3M_MA'] - macro_df['Growth_12M_MA']
+
+# 2. INFLATION MOMENTUM VECTOR (CPILFESL)
+# Step A: Transform raw index into a YoY percentage rate
+macro_df['YoY_Inflation'] = macro_df['CPILFESL'].pct_change(12)
+# Step B: Calculate moving averages on the YoY rate
+macro_df['Inflation_3M_MA'] = macro_df['YoY_Inflation'].rolling(window=3).mean()
+macro_df['Inflation_12M_MA'] = macro_df['YoY_Inflation'].rolling(window=12).mean()
+# Score > 0 means inflation is accelerating; Score <= 0 means decelerating
+macro_df['Inflation_Score'] = macro_df['Inflation_3M_MA'] - macro_df['Inflation_12M_MA']
+
+print("✅ Mathematical momentum scores calculated.")
+
+# 3. DEFINE THE REGIME ASSIGNMENT LOGIC
+def assign_quadrant(row):
+    # If we don't have enough data history yet for the 12M moving averages, return NaN
+    if pd.isna(row['Growth_Score']) or pd.isna(row['Inflation_Score']):
         return np.nan
-    g, i = row["Growth_Score"], row["Inflation_Score"]
-    if g > 0 and i > 0: return "Reflation"
-    if g > 0 and i <= 0: return "Goldilocks"
-    if g <= 0 and i > 0: return "Stagflation"
-    return "Disinflation / Slowdown"
 
-quarterly["Regime"] = quarterly.apply(regime, axis=1)
-quarterly["Quarter_End"] = quarterly.index.to_timestamp(how="end").normalize()
-print("Quarterly macro regimes:", quarterly["Regime"].value_counts(dropna=False).to_dict())
-display(quarterly.tail(8))
+    g = row['Growth_Score']
+    i = row['Inflation_Score']
 
-sector_returns = pd.DataFrame()
-for ticker in SECTORS:
-    df = pd.read_csv(locate(ticker))
-    df["Date"] = pd.to_datetime(df["Date"])
-    df["Adj Close"] = pd.to_numeric(df["Adj Close"], errors="coerce")
-    df = df.dropna(subset=["Date"]).sort_values("Date").drop_duplicates("Date", keep="last").set_index("Date")
-    # Monthly files use first-of-month date labels; retain only the calendar quarter's final month.
-    endpoint = df.loc[df.index.month.isin([3, 6, 9, 12]), "Adj Close"].copy()
-    endpoint.index = endpoint.index.to_period("Q")
-    endpoint = endpoint.reindex(quarterly.index)  # No filling across missing quarters.
-    sector_returns[ticker] = endpoint.pct_change(fill_method=None) * 100
+    if g > 0 and i > 0:
+        return "High GDP / High Inflation"
+    elif g <= 0 and i > 0:
+        return "Low GDP / High Inflation"
+    elif g <= 0 and i <= 0:
+        return "Low GDP / Low Inflation"
+    else:  # g > 0 and i <= 0
+        return "High GDP / Low Inflation"
 
-master = quarterly.join(sector_returns)
-master = master.dropna(subset=["Regime"])
-print("Quarterly classified observations:", len(master))
-print("Sector observations by ticker:")
-print(master[SECTORS].count())
+# Apply the logic engine across the dataframe
+macro_df['Quadrant'] = macro_df.apply(assign_quadrant, axis=1)
 
-mean_returns = master.groupby("Regime")[SECTORS].mean().reindex(REGIMES).T
-positive_hit_rate = master.groupby("Regime")[SECTORS].agg(lambda x: (x.dropna() > 0).mean() * 100 if x.notna().any() else np.nan).reindex(REGIMES).T
-observation_counts = master.groupby("Regime")[SECTORS].count().reindex(REGIMES).T
-sector_benchmark = master[SECTORS].mean(axis=1, skipna=True)
-relative_win = master[SECTORS].gt(sector_benchmark, axis=0).where(master[SECTORS].notna())
-relative_win["Regime"] = master["Regime"]
-outperformance_rate = relative_win.groupby("Regime")[SECTORS].mean().reindex(REGIMES).T * 100
+print("✅ 4-Quadrant macro sorting complete.")
 
+print("\n🔍 --- STAGE 2 VERIFICATION REPORT ---")
+print("Distribution of Historical Macro Quadrants:")
+print(macro_df['Quadrant'].value_counts(dropna=False))
+print("=======================================")
 
+print("\n⏳ Stage 3: Running Quantitative Sector Backtest...")
 
+# 1. MERGE MACRO REGIMES WITH ETF RETURNS
+# We use an 'inner' merge to automatically drop any dates that don't overlap
+master_df = pd.merge(macro_df, merged_sectors, on='Date', how='inner')
 
+# Drop the 23 structural NaN rows from our evaluation pool
+master_df = master_df.dropna(subset=['Quadrant']).reset_index(drop=True)
 
-forward = master[["Regime"]].join(sector_returns[SECTORS].shift(-1).add_prefix("NextQ_"))
-forward_mean = forward.groupby("Regime")[[f"NextQ_{s}" for s in SECTORS]].mean().reindex(REGIMES).T
-forward_mean.index = SECTORS
+# 2. INITIALIZE ARRAYS TO HOLD RESULTS
+quadrants = [
+    "High GDP / High Inflation",
+    "Low GDP / High Inflation",
+    "Low GDP / Low Inflation",
+    "High GDP / Low Inflation"
+]
 
-# Transition matrix: only consecutive calendar quarters count.
-regime_pairs = pd.DataFrame({"Current": master["Regime"], "Next": master["Regime"].shift(-1), "Next_Quarter": pd.Series(master.index.shift(1), index=master.index)})
-regime_pairs = regime_pairs.loc[regime_pairs["Next_Quarter"] == regime_pairs.index + 1]
-transitions = pd.crosstab(regime_pairs["Current"], regime_pairs["Next"]).reindex(index=REGIMES, columns=REGIMES, fill_value=0)
-transition_probs = transitions.div(transitions.sum(axis=1).replace(0, np.nan), axis=0) * 100
+avg_returns = {}
+hit_rates = {}
 
-with pd.ExcelWriter(OUTPUT, engine="openpyxl") as writer:
-    quarterly.reset_index().to_excel(writer, sheet_name="Quarterly_Regimes", index=False)
-    master.reset_index().to_excel(writer, sheet_name="Master_Quarterly", index=False)
-    mean_returns.to_excel(writer, sheet_name="Avg_Quarterly_Returns")
-    positive_hit_rate.to_excel(writer, sheet_name="Positive_Hit_Rates")
-    outperformance_rate.to_excel(writer, sheet_name="Relative_Win_Rates")
-    observation_counts.to_excel(writer, sheet_name="Observation_Counts")
-    transition_probs.to_excel(writer, sheet_name="Regime_Transitions")
-    forward_mean.to_excel(writer, sheet_name="Next_Q_Exploratory")
-print("Exported:", OUTPUT.resolve())
-print("Core calculations complete. Run any visualization cell below.")
+# 3. LOOP THROUGH REGIMES AND CALCULATE PERFORMANCE
+for q in quadrants:
+    # Filter our database for just the months that match the current quadrant
+    q_df = master_df[master_df['Quadrant'] == q]
+
+    avg_returns[q] = {}
+    hit_rates[q] = {}
+
+    for ticker in sectors:
+        ret_col = f'{ticker}_Return'
+
+        # Pull valid return streams for the sector in this quadrant
+        valid_rets = q_df[ret_col].dropna()
+
+        if len(valid_rets) > 0:
+            # Calculate Mean Monthly Return
+            avg_returns[q][ticker] = valid_rets.mean()
+            # Calculate Hit Rate (Months with positive returns / total months)
+            hit_rates[q][ticker] = (valid_rets > 0).sum() / len(valid_rets)
+        else:
+            avg_returns[q][ticker] = np.nan
+            hit_rates[q][ticker] = np.nan
+
+# 4. CONVERT RAW ARRAYS INTO PRESENTATION MATRICES (%)
+df_avg_returns = pd.DataFrame(avg_returns) * 100
+df_hit_rates = pd.DataFrame(hit_rates) * 100
+
+print("\n=======================================================")
+print("     MATRIX 1: AVERAGE MONTHLY RETURNS (%)")
+print("=======================================================")
+print(df_avg_returns.round(2))
+
+print("\n=======================================================")
+print("     MATRIX 2: REGIME WIN/HIT RATES (%)")
+print("=======================================================")
+print(df_hit_rates.round(2))
+
+# 5. EXPORT DELIVERABLE TO YOUR DIRECTORY
+df_avg_returns.to_excel("Tactical_Sector_Returns.xlsx")
+print("\n💾 Success! Your results have been exported to 'Tactical_Sector_Returns.xlsx'.")
+
+# Create a clean, historical timeline ledger of our macro regimes
+historical_ledger = master_df[['Date', 'INDPRO', 'Growth_Score', 'CPILFESL', 'Inflation_Score', 'Quadrant']]
+
+# Save it to a separate tab in your Excel file
+with pd.ExcelWriter("Tactical_Sector_Returns.xlsx", mode='a', engine='openpyxl') as writer:
+    historical_ledger.to_excel(writer, sheet_name="Historical_Timeline", index=False)
+
+print("📅 Historical timeline with exact dates exported to the 'Historical_Timeline' tab!")
